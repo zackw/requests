@@ -8,12 +8,24 @@ Release History
 
 **API Changes**
 
+Improved handling of redirections, particularly for applications that
+need to walk chains of redirections manually rather than just skipping
+to the final response:
+
 - New ``Response`` property ``is_redirect``, which is true when the
   library could have processed this response as a redirection (whether
   or not it actually did).
-- New ``Session`` method ``prepare_request_for_redirect``, which takes
-  a ``Response`` object that is a redirect, and generates a new
-  ``PreparedRequest`` to the destination of the redirect.
+- New ``Session`` methods:
+  + ``prepare_request_for_redirect`` takes a ``Response`` object that
+    is a redirect, and generates a new ``PreparedRequest`` to the
+    destination of the redirect.
+  + ``send_single`` replaces ``send`` with ``allow_redirects=False``.
+    That mode of ``send`` is deprecated, but preserved for backward
+    compatibility.
+  + ``send_iter_redirects`` replaces ``resolve_redirects`` (which is
+    now deprecated, but, again, preserved for compatibility).
+    It produces an iterator over all responses in an HTTP redirection
+    chain, eliminating the need to special-case the first response.
 
 **Bugfixes**
 
@@ -26,6 +38,8 @@ Release History
   optional and ignored.  This removes an opportunity to shoot yourself
   in the foot by passing something other than ``resp.request`` as this
   argument.
+- ``Response.history`` is now always a list, not a tuple.
+- The documentation for ``Session.send`` and friends has been improved.
 
 2.2.1 (2014-01-23)
 ++++++++++++++++++

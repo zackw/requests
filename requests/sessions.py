@@ -9,6 +9,7 @@ requests (cookies, auth, proxies).
 
 """
 import os
+import warnings
 from collections import Mapping
 from datetime import datetime
 
@@ -78,29 +79,59 @@ def merge_hooks(request_hooks, session_hooks, dict_class=OrderedDict):
     return merge_setting(request_hooks, session_hooks, dict_class)
 
 
-class SessionRedirectMixin(object):
-    def resolve_redirects(self, resp, req=None, **kwargs):
-        """Receives a Response. Returns a generator of Responses."""
+class RedirectIterator(object):
+    """Iterator over HTTP redirections leading up to a final response.
+    Normally should be created via :meth:`Session.send_iter_redirects`,
+    not directly.
 
-        i = 0
-        while resp.is_redirect:
-            resp.content  # Consume socket so it can be released
+    :param request: A :class:`PreparedRequest` with which to begin the
+        sequence of HTTP requests.
+    :param session: A :class:`Session` object to use in preparing and
+        sending each request in the sequence.
+    :param adapter_args: Dictionary of additional arguments to pass to
+        the protocol adapter.
+    """
 
-            if i >= self.max_redirects:
+    def __init__(self, request, session, adapter_args):
+        self.first_request = request
+        self.session = session
+        self.max_redirects = session.max_redirects
+        self.adapter_args = adapter_args
+        self.chain = []
+
+    # Internal use only (for Session.resolve_redirects)
+    @classmethod
+    def from_first_response(cls, response, session, adapter_args):
+        rv = cls(response.request, session, adapter_args)
+        rv.chain.append(response)
+        return rv
+
+    def __next__(self):
+        if len(self.chain) == 0:
+            req = self.first_request
+        else:
+            prev_resp = self.chain[-1]
+            if not prev_resp.is_redirect:
+                raise StopIteration
+            if len(self.chain) >= self.max_redirects:
                 raise TooManyRedirects('Exceeded %s redirects.'
                                        % self.max_redirects)
 
-            resp = self.send(
-                self.prepare_request_for_redirect(resp),
-                allow_redirects=False,
-                **kwargs
-            )
+            prev_resp.content # Consume socket so it can be released
+            req = self.session.prepare_request_for_redirect(prev_resp)
 
-            i += 1
-            yield resp
+        resp = self.session.send_single(req, **self.adapter_args)
+        self.chain.append(resp)
+        return resp
 
+    # Required for iterator protocol.
+    def __iter__(self):
+        return self
 
-class Session(SessionRedirectMixin):
+    # Required for Python 2 compatibility.
+    next = __next__
+
+class Session(object):
     """A Requests session.
 
     Provides cookie persistence, connection-pooling, and configuration.
@@ -468,18 +499,96 @@ class Session(SessionRedirectMixin):
         return self.request('DELETE', url, **kwargs)
 
     def send(self, request, allow_redirects=True, **kwargs):
-        """Send a given PreparedRequest."""
+        """Send a prepared request.  Follows HTTP redirections and
+        returns the final response (the redirection chain is available
+        via the :attr:`~Response.history` attribute).
+
+        :param request: The request to send.
+        :type request: :class:`PreparedRequest`
+
+        :param bool stream: (optional) whether or not to stream the
+            response body. Defaults to :attr:`self.stream`, which defaults
+            to :const:`False`.
+        :param bool verify: (optional) whether to verify SSL certificates.
+            Defaults to :attr:`self.verify`, which defaults to :const:`True`.
+        :param cert: (optional) Path to SSL client certificate (.pem).
+            If a 2-tuple, path to client certificate + path to associated
+            private key, in that order.  Defaults to :attr:`self.cert`,
+            which defaults to :const:`None`.
+        :type cert: string or 2-tuple of strings
+        :param dict proxies: (optional) Dictionary mapping protocols to
+            proxy URLs.  Defaults to :attr:`self.proxies`, which defaults
+            to :const:`{}`.
+        :param \*\*kwargs: Other keyword arguments are accepted and passed
+            through to the transport adapter.
+
+        :param bool allow_redirects: (optional) (**deprecated**) If set to
+            :const:`False`, this method behaves the same as
+            :meth:`~.send_single`, i.e. HTTP redirections are *not*
+            followed.
+
+        :return: A :class:`Response` object.
+        """
+
+        if not allow_redirects:
+            warnings.warn("The allow_redirects argument to Session.send is "
+                          "deprecated, use Session.send_single instead",
+                          DeprecationWarning, stacklevel=2)
+            return self.send_single(request, **kwargs)
+
+        gen = self.send_iter_redirects(request, **kwargs)
+        history = [resp for resp in gen]
+        r = history[-1]
+        r.history = history
+        return r
+
+    def send_iter_redirects(self, request, **kwargs):
+        """Send a prepared request.  Returns an iterator over HTTP
+        redirections::
+
+            for resp in sess.send_iter_redirects(req):
+                process_response(resp)
+
+        will call ``process_response`` once for each response in a
+        redirection chain, including the final (non-redirect)
+        response.  Note that each request in the sequence only fires
+        when the iterator is advanced, e.g. after::
+
+            chain = sess.send_iter_redirects(req)
+
+        the first request has not yet been sent.
+
+        :param request: The request to send.
+        :type request: :class:`PreparedRequest`
+        :param \*\*kwargs: Keyword arguments behave as described for
+            :meth:`~.send`.
+        :return: A :class:`RedirectIterator` object.
+        """
+        return RedirectIterator(request, self, kwargs)
+
+    def send_single(self, request, **kwargs):
+        """Send a prepared request.  HTTP redirections are not followed;
+        the returned :class:`Response` is for the exact request that was
+        sent.
+
+        :param request: The request to send.
+        :type request: :class:`PreparedRequest`
+        :param \*\*kwargs: Keyword arguments behave as described for
+            :meth:`~.send`.
+        :return: A :class:`Response` object.
+        """
+
+        # It's possible that users might accidentally send a Request object.
+        # Guard against that specific failure case.
+        if not isinstance(request, PreparedRequest):
+            raise ValueError('You can only send PreparedRequests.')
+
         # Set defaults that the hooks can utilize to ensure they always have
         # the correct parameters to reproduce the previous request.
         kwargs.setdefault('stream', self.stream)
         kwargs.setdefault('verify', self.verify)
         kwargs.setdefault('cert', self.cert)
         kwargs.setdefault('proxies', self.proxies)
-
-        # It's possible that users might accidentally send a Request object.
-        # Guard against that specific failure case.
-        if not isinstance(request, PreparedRequest):
-            raise ValueError('You can only send PreparedRequests.')
 
         # Get the appropriate adapter to use
         adapter = self.get_adapter(url=request.url)
@@ -502,22 +611,26 @@ class Session(SessionRedirectMixin):
             extract_cookies_to_jar(self.cookies, resp.request, resp.raw)
         extract_cookies_to_jar(self.cookies, request, r.raw)
 
-        if not allow_redirects:
-            return r
-
-        # Redirect resolving generator.
-        gen = self.resolve_redirects(r, req=None, **kwargs)
-        history = [resp for resp in gen]
-
-        # Shuffle things around if there's history.
-        if history:
-            # Insert the first (original) request at the start
-            history.insert(0, r)
-            # Get the last request made
-            r = history.pop()
-            r.history = tuple(history)
-
         return r
+
+    def resolve_redirects(self, resp, req=None, **kwargs):
+        """Given a :class:`Response`, which must be an HTTP redirect,
+        produce an iterator over all subsequent responses in the
+        redirection chain, culminating in the final (non-redirect)
+        response.
+
+        **Deprecated.** Use `~.send_iter_redirects` instead.
+
+        :param resp: The first response in a redirection chain.
+        :type resp: :class:`Response`
+        :param req: (optional) Ignored for backward source compatibility.
+        :param \*\*kwargs: Keyword arguments behave as described for
+            :meth:`~.send`.
+        """
+        warnings.warn("Session.resolve_redirects is deprecated, use "
+                      "Session.send_iter_redirects instead",
+                      DeprecationWarning, stacklevel=2)
+        return RedirectIterator.from_first_response(resp, self, kwargs)
 
     def get_adapter(self, url):
         """Returns the appropriate connnection adapter for the given URL."""
