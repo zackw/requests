@@ -79,104 +79,22 @@ def merge_hooks(request_hooks, session_hooks, dict_class=OrderedDict):
 
 
 class SessionRedirectMixin(object):
-    def resolve_redirects(self, resp, req, stream=False, timeout=None,
-                          verify=True, cert=None, proxies=None):
+    def resolve_redirects(self, resp, req=None, **kwargs):
         """Receives a Response. Returns a generator of Responses."""
 
         i = 0
-
         while resp.is_redirect:
-            prepared_request = req.copy()
-
             resp.content  # Consume socket so it can be released
 
             if i >= self.max_redirects:
-                raise TooManyRedirects('Exceeded %s redirects.' % self.max_redirects)
-
-            # Release the connection back into the pool.
-            resp.close()
-
-            url = resp.headers['location']
-            method = req.method
-
-            # Handle redirection without scheme (see: RFC 1808 Section 4)
-            if url.startswith('//'):
-                parsed_rurl = urlparse(resp.url)
-                url = '%s:%s' % (parsed_rurl.scheme, url)
-
-            # The scheme should be lower case...
-            parsed = urlparse(url)
-            url = parsed.geturl()
-
-            # Facilitate non-RFC2616-compliant 'location' headers
-            # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
-            # Compliant with RFC3986, we percent encode the url.
-            if not urlparse(url).netloc:
-                url = urljoin(resp.url, requote_uri(url))
-            else:
-                url = requote_uri(url)
-
-            prepared_request.url = to_native_string(url)
-
-            # http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.3.4
-            if (resp.status_code == codes.see_other and
-                    method != 'HEAD'):
-                method = 'GET'
-
-            # Do what the browsers do, despite standards...
-            # First, turn 302s into GETs.
-            if resp.status_code == codes.found and method != 'HEAD':
-                method = 'GET'
-
-            # Second, if a POST is responded to with a 301, turn it into a GET.
-            # This bizarre behaviour is explained in Issue 1704.
-            if resp.status_code == codes.moved and method == 'POST':
-                method = 'GET'
-
-            prepared_request.method = method
-
-            # https://github.com/kennethreitz/requests/issues/1084
-            if resp.status_code not in (codes.temporary, codes.resume):
-                if 'Content-Length' in prepared_request.headers:
-                    del prepared_request.headers['Content-Length']
-
-                prepared_request.body = None
-
-            headers = prepared_request.headers
-            try:
-                del headers['Cookie']
-            except KeyError:
-                pass
-
-            extract_cookies_to_jar(prepared_request._cookies, prepared_request, resp.raw)
-            prepared_request._cookies.update(self.cookies)
-            prepared_request.prepare_cookies(prepared_request._cookies)
-
-            if 'Authorization' in headers:
-                # If we get redirected to a new host, we should strip out any
-                # authentication headers.
-                original_parsed = urlparse(resp.request.url)
-                redirect_parsed = urlparse(url)
-
-                if (original_parsed.hostname != redirect_parsed.hostname):
-                    del headers['Authorization']
-
-            # .netrc might have more auth for us.
-            new_auth = get_netrc_auth(url) if self.trust_env else None
-            if new_auth is not None:
-                prepared_request.prepare_auth(new_auth)
+                raise TooManyRedirects('Exceeded %s redirects.'
+                                       % self.max_redirects)
 
             resp = self.send(
-                prepared_request,
-                stream=stream,
-                timeout=timeout,
-                verify=verify,
-                cert=cert,
-                proxies=proxies,
+                self.prepare_request_for_redirect(resp),
                 allow_redirects=False,
+                **kwargs
             )
-
-            extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
 
             i += 1
             yield resp
@@ -294,6 +212,94 @@ class Session(SessionRedirectMixin):
             cookies=merged_cookies,
             hooks=merge_hooks(request.hooks, self.hooks),
         )
+        return p
+
+    def prepare_request_for_redirect(self, response):
+        """Constructs a :class:`PreparedRequest` which will follow a
+        redirection.  Settings are merged from the :class:`Session` as
+        for :meth:`~.prepare_request`.
+
+        :param response: :class:`Response` object containing a redirection
+            directive. :meth:`Response.is_redirect` must be true.
+        """
+
+        if not response.is_redirect:
+            if response.status_code not in REDIRECT_STATI:
+                raise ValueError("%s: not a redirect" % repr(response))
+            else:
+                raise ValueError("%s: invalid redirect (no Location)"
+                                 % repr(response))
+
+        p = response.request.copy()
+
+        # Determine the destination URL...
+        url = response.headers['location']
+        # Handle redirection without scheme (see: RFC 1808 Section 4)
+        if url.startswith('//'):
+            parsed_rurl = urlparse(response.url)
+            url = '%s:%s' % (parsed_rurl.scheme, url)
+
+        # The scheme should be lower case...
+        parsed = urlparse(url)
+        url = parsed.geturl()
+
+        # Facilitate non-RFC2616-compliant 'location' headers
+        # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
+        # Compliant with RFC3986, we percent encode the url.
+        if not urlparse(url).netloc:
+            url = urljoin(response.url, requote_uri(url))
+        else:
+            url = requote_uri(url)
+
+        p.url = to_native_string(url)
+
+        # ... and the method to use for the new request.
+        method = p.method
+        # http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.3.4
+        if response.status_code == codes.see_other and method != 'HEAD':
+            method = 'GET'
+
+        # Do what the browsers do, despite standards...
+        # First, turn 302s into GETs.
+        if response.status_code == codes.found and method != 'HEAD':
+            method = 'GET'
+
+        # Second, if a POST is responded to with a 301, turn it into a GET.
+        # This bizarre behaviour is explained in Issue 1704.
+        if response.status_code == codes.moved and method == 'POST':
+            method = 'GET'
+
+        p.method = method
+
+        # Other header adjustments:
+        # https://github.com/kennethreitz/requests/issues/1084
+        headers = p.headers
+        if response.status_code not in (codes.temporary, codes.resume):
+            p.body = None
+            if 'Content-Length' in headers:
+                del headers['Content-Length']
+
+        if 'Cookie' in headers:
+            del headers['Cookie']
+
+        extract_cookies_to_jar(p._cookies, p, response.raw)
+        p._cookies.update(self.cookies)
+        p.prepare_cookies(p._cookies)
+
+        if 'Authorization' in headers:
+            # If we get redirected to a new host, we should strip out any
+            # authentication headers.
+            original_parsed = urlparse(response.request.url)
+            redirect_parsed = urlparse(url)
+
+            if (original_parsed.hostname != redirect_parsed.hostname):
+                del headers['Authorization']
+
+        # .netrc might have more auth for us.
+        new_auth = get_netrc_auth(url) if self.trust_env else None
+        if new_auth is not None:
+            p.prepare_auth(new_auth)
+
         return p
 
     def request(self, method, url,
@@ -461,7 +467,7 @@ class Session(SessionRedirectMixin):
 
         return self.request('DELETE', url, **kwargs)
 
-    def send(self, request, **kwargs):
+    def send(self, request, allow_redirects=True, **kwargs):
         """Send a given PreparedRequest."""
         # Set defaults that the hooks can utilize to ensure they always have
         # the correct parameters to reproduce the previous request.
@@ -474,15 +480,6 @@ class Session(SessionRedirectMixin):
         # Guard against that specific failure case.
         if not isinstance(request, PreparedRequest):
             raise ValueError('You can only send PreparedRequests.')
-
-        # Set up variables needed for resolve_redirects and dispatching of hooks
-        allow_redirects = kwargs.pop('allow_redirects', True)
-        stream = kwargs.get('stream')
-        timeout = kwargs.get('timeout')
-        verify = kwargs.get('verify')
-        cert = kwargs.get('cert')
-        proxies = kwargs.get('proxies')
-        hooks = request.hooks
 
         # Get the appropriate adapter to use
         adapter = self.get_adapter(url=request.url)
@@ -497,27 +494,20 @@ class Session(SessionRedirectMixin):
         r.elapsed = datetime.utcnow() - start
 
         # Response manipulation hooks
-        r = dispatch_hook('response', hooks, r, **kwargs)
+        r = dispatch_hook('response', request.hooks, r, **kwargs)
 
         # Persist cookies
-        if r.history:
-
-            # If the hooks create history then we want those cookies too
-            for resp in r.history:
-                extract_cookies_to_jar(self.cookies, resp.request, resp.raw)
-
+        # If the hooks create history then we want those cookies too
+        for resp in r.history:
+            extract_cookies_to_jar(self.cookies, resp.request, resp.raw)
         extract_cookies_to_jar(self.cookies, request, r.raw)
 
-        # Redirect resolving generator.
-        gen = self.resolve_redirects(r, request,
-            stream=stream,
-            timeout=timeout,
-            verify=verify,
-            cert=cert,
-            proxies=proxies)
+        if not allow_redirects:
+            return r
 
-        # Resolve redirects if allowed.
-        history = [resp for resp in gen] if allow_redirects else []
+        # Redirect resolving generator.
+        gen = self.resolve_redirects(r, req=None, **kwargs)
+        history = [resp for resp in gen]
 
         # Shuffle things around if there's history.
         if history:

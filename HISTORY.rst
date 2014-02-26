@@ -11,6 +11,21 @@ Release History
 - New ``Response`` property ``is_redirect``, which is true when the
   library could have processed this response as a redirection (whether
   or not it actually did).
+- New ``Session`` method ``prepare_request_for_redirect``, which takes
+  a ``Response`` object that is a redirect, and generates a new
+  ``PreparedRequest`` to the destination of the redirect.
+
+**Bugfixes**
+
+- ``Session.send`` will now remember and apply arbitrary adapter-specific
+  keyword arguments when processing redirects, in addition to the
+  standard five (``stream``, ``timeout``, ``verify``, ``cert``, ``proxies``).
+- ``Session.resolve_redirects`` now also accepts arbitrary adapter-specific
+  keyword arguments.
+- The ``req`` argument to ``Session.resolve_redirects`` is now
+  optional and ignored.  This removes an opportunity to shoot yourself
+  in the foot by passing something other than ``resp.request`` as this
+  argument.
 
 2.2.1 (2014-01-23)
 ++++++++++++++++++
